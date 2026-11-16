@@ -56,8 +56,10 @@ res = una::casesens::find_utf8(string1, string2);
 } else {
 res = una::caseless::find_utf8(string1, string2);
 }
-auto start = res.pos();
-auto end = res.end_pos();
+// As uint64, which the array holds: the size_t of a 32-bit target (armeabi-v7a) was copied as 8 bytes, 4 of them from beyond it. Not
+// found is the largest uint64 on every target (size_t's npos, 2^32 - 1 there).
+asQWORD start = res ? asQWORD(res.pos()) : ~asQWORD(0);
+asQWORD end = res ? asQWORD(res.end_pos()) : ~asQWORD(0);
 auto array = CScriptArray::Create(asGetActiveContext()->GetEngine()->GetTypeInfoByDecl("array<uint64>"));
 array->InsertLast(&start);
 array->InsertLast(&end);
@@ -172,7 +174,15 @@ return una::codepoint::is_control(actual_chars[0]);
 std::string get_script(const std::string& chr) {
 const auto actual_chars = una::utf8to32u(chr);
 const char32_t script = una::codepoint::get_script(actual_chars[0]);
-return una::utf32to8(std::u32string(&script));
+// The script is its ISO 15924 code, four letters packed into the char32_t (see una::locale::script). It was taken for a codepoint, in a
+// string made from the address of that one char32_t, read on past it to a zero: a replacement character and stack bytes ("a" gave
+// "\xEF\xBF\xBD\xC6\x93\x01", not "Latn").
+std::string result;
+for (int shift = 24; shift >= 0; shift -= 8) {
+	const char c = char((script >> shift) & 0xFF);
+	if (c) result += c;
+}
+return result;
 }
 
 bool has_script(const std::string& chr, const std::string& script) {
@@ -236,10 +246,10 @@ shared->script_engine->RegisterObjectMethod("string", "bool is_nfd() const", asF
 shared->script_engine->RegisterObjectMethod("string", "bool is_nfkc() const", asFUNCTION(is_nfkc), asCALL_CDECL_OBJFIRST);
 shared->script_engine->RegisterObjectMethod("string", "bool is_nfkd() const", asFUNCTION(is_nfkd), asCALL_CDECL_OBJFIRST);
 shared->script_engine->RegisterObjectMethod("string", "unicode::general_category general_category() const", asFUNCTION(get_general_category), asCALL_CDECL_OBJFIRST);
-shared->script_engine->RegisterObjectMethod("string", "bool is_alphabetic() const", asFUNCTION(is_alphabetic), asCALL_CDECL_OBJFIRST);
+// is_alphabetic(), is_alphanumeric() and is_whitespace() aren't registered: NVGT's string has them, with an encoding parameter that has
+// a default, so a call without arguments matched both and no script loading this plugin compiled one ("Multiple matching signatures",
+// form.nvgt's among them). The plugin's could never be called.
 shared->script_engine->RegisterObjectMethod("string", "bool is_numeric() const", asFUNCTION(is_numeric), asCALL_CDECL_OBJFIRST);
-shared->script_engine->RegisterObjectMethod("string", "bool is_alphanumeric() const", asFUNCTION(is_alphanumeric), asCALL_CDECL_OBJFIRST);
-shared->script_engine->RegisterObjectMethod("string", "bool is_whitespace() const", asFUNCTION(is_whitespace), asCALL_CDECL_OBJFIRST);
 shared->script_engine->RegisterObjectMethod("string", "bool is_reserved() const", asFUNCTION(is_reserved), asCALL_CDECL_OBJFIRST);
 shared->script_engine->RegisterObjectMethod("string", "bool is_valid_char() const", asFUNCTION(is_valid_char), asCALL_CDECL_OBJFIRST);
 shared->script_engine->RegisterObjectMethod("string", "bool is_valid_scalar() const", asFUNCTION(is_valid_scalar), asCALL_CDECL_OBJFIRST);
