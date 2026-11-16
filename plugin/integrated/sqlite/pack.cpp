@@ -184,18 +184,30 @@ void pack::load_entry_cache() const {
 }
 
 bool pack::open(const string& filename, int mode, const string& key) {
-	if (mode & SQLITE_OPEN_READONLY) {
-		if (const auto rc = sqlite3_open_v2(filename.c_str(), &db, SQLITE_OPEN_READONLY | SQLITE_OPEN_EXRESCODE, nullptr); rc != SQLITE_OK)
-			return false;
-		setup_db_read(db, key);
-	} else {
-		if (const auto rc = sqlite3_open_v2(filename.data(), &db, mode | SQLITE_OPEN_EXRESCODE, nullptr); rc != SQLITE_OK)
-			return false;
-		setup_db_write(db, key);
+	// A pack already open is closed first: its connection was overwritten and stayed open. A connection that fails to open, to be set
+	// up or to be read is closed too: sqlite3_open_v2() gives a handle even when it fails, which was kept, so the pack read as active.
+	close();
+	try {
+		if (mode & SQLITE_OPEN_READONLY) {
+			if (const auto rc = sqlite3_open_v2(filename.c_str(), &db, SQLITE_OPEN_READONLY | SQLITE_OPEN_EXRESCODE, nullptr); rc != SQLITE_OK) {
+				close();
+				return false;
+			}
+			setup_db_read(db, key);
+		} else {
+			if (const auto rc = sqlite3_open_v2(filename.data(), &db, mode | SQLITE_OPEN_EXRESCODE, nullptr); rc != SQLITE_OK) {
+				close();
+				return false;
+			}
+			setup_db_write(db, key);
+		}
+		if (!key.empty()) set_key(key);
+		pack_name = filesystem::canonical(filename).string();
+		load_entry_cache(); // The first read: a wrong key fails here
+	} catch (...) {
+		close();
+		throw;
 	}
-	if (!key.empty()) set_key(key);
-	pack_name = filesystem::canonical(filename).string();
-	load_entry_cache();
 	return true;
 }
 
@@ -208,10 +220,11 @@ bool pack::open(const string& filename, const string& key, bool rw) {
 }
 
 pack::~pack() {
-	if (db && !created_from_copy) {
-		sqlite3_close(db);
-		db = nullptr;
-	}
+	// A read-only copy (make_immutable(), which the sound system makes for every sound loaded from the pack) has a connection of its
+	// own, opened in the copy constructor, and a reference to the pack it was made from: neither was let go of, so each such load left a
+	// connection open (a file handle and up to 256 MB of address space mapped, see setup_db_read) and the pack alive for good.
+	close();
+	if (created_from_copy && mutable_origin) mutable_origin->release();
 }
 
 bool pack::rekey(const string& key) {
@@ -221,8 +234,15 @@ bool pack::rekey(const string& key) {
 	return true;
 }
 
+// Closed with sqlite3_close_v2(): with a statement or a file stream still open, sqlite3_close() refused (SQLITE_BUSY) and the
+// connection stayed open. The handle was kept after closing, so the destructor closed it a second time (a use of freed memory), and
+// every call after close() used the freed connection; the files listed were those of the closed pack.
 bool pack::close() {
-	return sqlite3_close(db) == SQLITE_OK;
+	if (!db) return false;
+	const bool ok = sqlite3_close_v2(db) == SQLITE_OK;
+	db = nullptr;
+	entry_cache.clear();
+	return ok;
 }
 
 bool pack::add_file(const string& disk_filename, const string& pack_filename, bool allow_replace) {
@@ -285,7 +305,7 @@ bool pack::add_memory(const string& pack_filename, unsigned char* data, unsigned
 }
 
 bool pack::add_memory(const string& pack_filename, const string& data, bool allow_replace) {
-	if (data.empty() || data.size() > SQLITE_MAX_LENGTH) return false;
+	if (data.size() > SQLITE_MAX_LENGTH) return false; // An empty file is added, as add_file() and add_stream() add one.
 	if (file_exists(pack_filename)) {
 		if (!allow_replace) return false;
 		delete_file(pack_filename);
@@ -352,7 +372,7 @@ unsigned int pack::read_file(const string& pack_filename, unsigned int offset, u
 	if (const auto rc = sqlite3_blob_open(db, "main", "pack_files", "data", rowid, 0, &blob); rc != SQLITE_OK)
 		throw runtime_error(Poco::format("Internal error: %s", string(sqlite3_errmsg(db))));
 	const auto blob_size = static_cast<unsigned>(sqlite3_blob_bytes(blob));
-	if (offset >= blob_size || (offset + size) > blob_size) { sqlite3_blob_close(blob); return 0; }
+	if (offset >= blob_size || size > blob_size - offset) { sqlite3_blob_close(blob); return 0; } // offset + size wrapped, see read_file_string()
 	if (const auto rc = sqlite3_blob_read(blob, buffer, size, offset); rc != SQLITE_OK) {
 		sqlite3_blob_close(blob);
 		throw runtime_error(Poco::format("Internal error: %s", string(sqlite3_errmsg(db))));
@@ -368,7 +388,8 @@ string pack::read_file_string(const string& pack_filename, unsigned int offset, 
 	if (const auto rc = sqlite3_blob_open(db, "main", "pack_files", "data", rowid, 0, &blob); rc != SQLITE_OK)
 		throw runtime_error(Poco::format("Internal error: %s", string(sqlite3_errmsg(db))));
 	const auto blob_size = static_cast<unsigned>(sqlite3_blob_bytes(blob));
-	if (offset >= blob_size || (offset + size) > blob_size) { sqlite3_blob_close(blob); return ""; }
+	// size compared with what is left: offset + size wrapped past 2^32, so a size near 4 GB passed and a string of that size was made.
+	if (offset >= blob_size || size > blob_size - offset) { sqlite3_blob_close(blob); return ""; }
 	string res(size, '\0');
 	if (const auto rc = sqlite3_blob_read(blob, res.data(), size, offset); rc != SQLITE_OK) {
 		sqlite3_blob_close(blob);
@@ -432,7 +453,9 @@ CScriptArray* pack::find(const string& what, const FindMode mode) {
 		"select file_name from pack_files where file_name glob ?",
 		"select file_name from pack_files where file_name regexp ?"
 	};
-	auto stmt = prepare_stmt(db, queries[static_cast<int>(mode)]);
+	const int query = static_cast<int>(mode);
+	if (query < 0 || query > 2) throw invalid_argument("invalid find mode"); // A mode that isn't one of the three read past the queries.
+	auto stmt = prepare_stmt(db, queries[query]);
 	bind_text(db, stmt, 1, what);
 	query_rows(db, stmt, [&](sqlite3_stmt* s) {
 		string res = column_string(s, 0);
@@ -453,10 +476,13 @@ CScriptArray* pack::exec(const string& sql) {
 		asITypeInfo* string_type = engine->GetTypeInfoByDecl("string");
 		CScriptDictionary* d = CScriptDictionary::Create(engine);
 		for (auto i = 0; i < column_count; ++i) {
-			if (column_data[i]) d->Set(columns[i], column_data[i], string_type->GetTypeId());
-			else { string null_string = "NULL"; d->Set(columns[i], &null_string, string_type->GetTypeId()); }
+			// Set() takes the address of a string: a column's text was given as it comes, a char pointer, which was read as a string
+			// object (an access violation on the first row of any result with a value that isn't null).
+			string value = column_data[i] ? column_data[i] : "NULL";
+			d->Set(columns[i], &value, string_type->GetTypeId());
 		}
-		array->InsertLast(&d);
+		array->InsertLast(&d); // The array holds a reference of its own: the one Create() gave was never let go of.
+		d->Release();
 		return 0;
 	}, array, &errmsg); rc != SQLITE_OK) {
 		if (errmsg) {
