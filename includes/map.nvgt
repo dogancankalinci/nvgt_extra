@@ -59,6 +59,7 @@ class map_loader {
 		script_function@ map_func = map_loader_module.get_function_by_decl("void map()");
 		if (@map_func == null) {
 			if (@err != null) err.insert_last("No 'void map()' function found!");
+			@g_loading_map = null; // it kept the map being loaded, as the failures above don't
 			return null;
 		}
 		dictionary@ r = map_func({}, err);
@@ -70,9 +71,20 @@ class map_loader {
 		if (!build_map(data, true, err)) return "";
 		return map_loader_module.get_bytecode(strip_debug);
 	}
+	// The property was function_namespace to set and functions_namespace to read, so neither name could be both read and written; each
+	// name now has both. A new namespace also takes effect: the functions imported from the old one were kept for every later map.
 	void set_function_namespace(const string&in ns) property {
 		if (ns.empty()) throw("map functions must exist in a valid namespace");
+		if (ns == map_functions_namespace) return;
 		map_functions_namespace = ns;
+		map_loader_imports = "";
+		map_functions_list.resize(0);
+	}
+	string get_function_namespace() const property {
+		return map_functions_namespace;
+	}
+	void set_functions_namespace(const string&in ns) property {
+		set_function_namespace(ns);
 	}
 	string get_functions_namespace() const property {
 		return map_functions_namespace;
