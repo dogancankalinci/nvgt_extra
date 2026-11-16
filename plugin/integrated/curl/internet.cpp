@@ -27,7 +27,7 @@ std::string url_encode(const std::string& url) {
 			r << "+";
 		else {
 			char tmp[4];
-			snprintf(tmp, 4, "%%%02X", url[i]);
+			snprintf(tmp, 4, "%%%02X", (unsigned char)url[i]); // as a byte: a char above 127 is negative, printed FFFFFFC3 and cut to %FF
 			r << tmp;
 		}
 	}
@@ -58,10 +58,10 @@ size_t internet_request_curl_progress(internet_request* req, curl_off_t dltotal,
 	if (dlnow == 0x150 || dltotal == 0x150) return 0;
 	req->bytes_downloaded = (double)dlnow;
 	req->download_size = (double)dltotal;
-	req->download_percent = (req->bytes_downloaded / req->download_size) * 100.0;
+	req->download_percent = dltotal > 0 ? (req->bytes_downloaded / req->download_size) * 100.0 : 0; // 0 / 0 gave NaN until the size was known
 	req->bytes_uploaded = (double)ulnow;
 	req->upload_size = (double)ultotal;
-	req->download_percent = (req->bytes_downloaded / req->download_size) * 100.0;
+	req->upload_percent = ultotal > 0 ? (req->bytes_uploaded / req->upload_size) * 100.0 : 0; // download_percent was set a second time instead
 	return req->abort_request ? 1 : 0;
 }
 size_t internet_request_curl_write(void* ptr, size_t size, size_t nmemb, std::string* data) {
@@ -139,8 +139,6 @@ int internet_request_thread(void* raw_request) {
 		curl_easy_setopt(curl, CURLOPT_HEADERDATA, &request->response_headers);
 		curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, internet_request_curl_progress);
 		curl_easy_setopt(curl, CURLOPT_XFERINFODATA, request);
-		long proto;
-		curl_easy_getinfo(curl, CURLINFO_SCHEME, &proto);
 		curl_slist* mail_rcpt = NULL;
 		if (request->payload != "") {
 			if (request->mail_from == "" && request->mail_to == "" && !ftp) {
@@ -175,7 +173,9 @@ int internet_request_thread(void* raw_request) {
 			curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, "MLSD");
 		char* url;
 		curl_easy_perform(curl);
-		curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &request->status_code);
+		long status_code = 0; // curl writes a long, 8 bytes on 64-bit Linux, Android and macOS, where status_code is an int
+		curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &status_code);
+		request->status_code = int(status_code);
 		curl_easy_getinfo(curl, CURLINFO_TOTAL_TIME, &request->total_time);
 		curl_easy_getinfo(curl, CURLINFO_EFFECTIVE_URL, &url);
 		if (url)
@@ -185,15 +185,18 @@ int internet_request_thread(void* raw_request) {
 			curl_slist_free_all(mail_rcpt);
 		curl_easy_cleanup(curl);
 		curl = NULL;
-		request->complete = true;
-		request->in_progress = false;
 		if (request->download_stream) {
 			fclose(request->download_stream);
 			request->download_stream = NULL;
 		}
+		request->complete = true;
+		request->in_progress = false;
+		request->Release(); // see perform()
 		return 0;
 	}
 	request->no_curl = true;
+	request->in_progress = false;
+	request->Release();
 	return 0;
 }
 
@@ -240,30 +243,31 @@ internet_request::internet_request(const std::string& url, bool autoperform) {
 		no_curl = true;
 }
 internet_request::internet_request(const std::string& url, const std::string& path, bool autoperform) {
+	RefCount = 1; // Before perform(), whose thread holds a reference of its own: set after, the count was 1 with the thread holding one.
 	initial_setup();
 	this->url = url;
 	this->path = path;
 	if (autoperform && !perform())
 		no_curl = true;
-	RefCount = 1;
 }
 internet_request::internet_request(const std::string& url, const std::string& username, const std::string& password, bool autoperform) {
+	RefCount = 1; // see above
 	initial_setup();
 	this->url = url;
 	this->auth_username = username;
 	this->auth_password = password;
 	if (autoperform && !perform())
 		no_curl = true;
-	RefCount = 1;
 }
 void internet_request::AddRef() {
 	asAtomicInc(RefCount);
 }
 void internet_request::Release() {
-	if (asAtomicDec(RefCount) < 1) {
-		abort_request = true;
-		delete this;
-	}
+	const int r = asAtomicDec(RefCount);
+	// While the request runs its thread holds a reference (see perform()): the script letting go of the last handle aborts it, and the
+	// thread deletes it when it ends. The object was deleted at once while the thread went on writing the response into it.
+	if (r == 1 && in_progress) abort_request = true;
+	if (r < 1) delete this;
 }
 bool internet_request::perform() {
 	if (in_progress)
@@ -274,8 +278,18 @@ bool internet_request::perform() {
 		response_body = "";
 		payload_cursor = 0;
 	}
-	if (thread_create(internet_request_thread, this, THREAD_STACK_SIZE_DEFAULT) == NULL)
+	// The thread holds a reference until it ends (see Release()), and is detached: its handle was never closed or joined, so every
+	// request kept a thread handle on Windows and, elsewhere, the ended thread's stack until the program ended.
+	in_progress = true;
+	abort_request = false;
+	AddRef();
+	thread_ptr_t thread = thread_create(internet_request_thread, this, THREAD_STACK_SIZE_DEFAULT);
+	if (thread == NULL) {
+		in_progress = false;
+		Release();
 		return false;
+	}
+	thread_detach(thread);
 	return true;
 }
 bool internet_request::perform(const std::string& URL) {
