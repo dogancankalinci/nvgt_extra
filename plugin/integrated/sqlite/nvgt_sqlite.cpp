@@ -176,12 +176,17 @@ int sqlite3DB::close() {
 		authorizer = NULL;
 	}
 	if (db) {
-		ret = sqlite3_close(db);
+		// Closed with sqlite3_close_v2(), as release() closes it: with a statement still alive (a sqlite3statement the script holds),
+		// sqlite3_close() refused with SQLITE_BUSY and the connection was let go of here open, until the program ended (its file stayed
+		// open and couldn't be deleted). It now closes once its last statement is finalized.
+		ret = sqlite3_close_v2(db);
 		db = NULL;
 	}
 	return ret;
 }
 int sqlite3DB::open(const std::string& filename, int mode) {
+	init_sqlite(); // The extensions are registered for this connection too: only the constructor without a file name registered them.
+	if (db) close(); // A database already open was overwritten without being closed, and stayed open.
 	return sqlite3_open_v2(filename.c_str(), &db, mode, NULL);
 }
 sqlite3statement* sqlite3DB::prepare(const std::string& statement, int* statement_tail) {
