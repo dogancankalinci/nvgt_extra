@@ -12,6 +12,7 @@
 
 #include "../../src/nvgt_plugin.h"
 #include "git.h"
+#include <git2/sys/errors.h>
 
 static bool libgit2_inited = false;
 static asIScriptEngine* g_ScriptEngine = NULL;
@@ -22,21 +23,28 @@ int nvgt_git_default_match_callback(const char* path, const char* matched, void*
 	asIScriptContext* ACtx = asGetActiveContext();
 	bool new_context = !ACtx || ACtx->PushState() < 0;
 	asIScriptContext* ctx = new_context ? g_ScriptEngine->RequestContext() : ACtx;
-	if (ctx->Prepare(repo->match_callback)) {
-		if (new_context) g_ScriptEngine->ReturnContext(ctx);
-		else ctx->PopState();
-		return GIT_EUSER;
-	}
-	std::string path_str(path, strlen(path));
-	std::string matched_str(matched, strlen(path));
-	ctx->SetArgObject(1, repo);
-	ctx->SetArgObject(2, &path_str);
-	ctx->SetArgObject(3, &repo->match_callback_payload);
+	if (!ctx) return GIT_EUSER;
+	// The arguments are the callback's three, from 0 (repo, path, user_data): they were set from 1, so the repository went in for the
+	// path, the path for the user data, and the user data nowhere. The matched pathspec isn't passed: it was copied with the length of
+	// the path, reading past its end.
+	std::string path_str(path ? path : "");
 	int ret = GIT_EUSER;
-	if (ctx->Execute() == asEXECUTION_FINISHED)
-		ret = ctx->GetReturnDWord();
+	if (ctx->Prepare(repo->match_callback) >= 0 && ctx->SetArgObject(0, repo) >= 0 && ctx->SetArgAddress(1, &path_str) >= 0 && ctx->SetArgAddress(2, &repo->match_callback_payload) >= 0) {
+		// A nested execution can't be left suspended (a sleep() or yield() of the context manager in the callback): popped while
+		// suspended, the callback's frames stayed where PopState() expects the nested call's marker. It is resumed until it ends, as
+		// NVGT's own callbacks do (execute_nested()).
+		int r;
+		while ((r = ctx->Execute()) == asEXECUTION_SUSPENDED) {}
+		if (r == asEXECUTION_FINISHED) ret = (int)ctx->GetReturnDWord();
+	}
 	if (new_context) g_ScriptEngine->ReturnContext(ctx);
-	else ctx->PopState();
+	else {
+		// exit() in the callback aborts the nested execution, which consumes the abort: it is passed on to the script that called
+		// add_all() and the rest, which went on running after exit() (NVGT's pop_nested_state()).
+		bool aborted = ctx->GetState() == asEXECUTION_ABORTED;
+		ctx->PopState();
+		if (aborted) ctx->Abort();
+	}
 	return ret;
 }
 int nvgt_git_changed_match_callback(const char* path, const char* matched, void* payload) {
@@ -56,7 +64,7 @@ inline git_strarray as_strarray2git_strarray(CScriptArray* as_array) {
 }
 
 
-nvgt_git_repository::nvgt_git_repository() : repo(NULL), index(NULL), ref_count(1) {
+nvgt_git_repository::nvgt_git_repository() : repo(NULL), index(NULL), handle(NULL), ref_count(1), busy(false), match_callback(NULL) {
 	if (!libgit2_inited) {
 		git_libgit2_init();
 		libgit2_inited = true;
@@ -74,86 +82,125 @@ void nvgt_git_repository::release() {
 int nvgt_git_repository::open(const std::string& path) {
 	if (repo) return GIT_EEXISTS;
 	int ret = git_repository_open(&repo, path.c_str());
-	if (ret == GIT_OK)
+	if (ret == GIT_OK) {
 		git_repository_index(&index, repo);
+		handle = new nvgt_git_repository_handle(repo, index);
+	} else repo = NULL;
 	return ret;
 }
 int nvgt_git_repository::create(const std::string& path) {
 	if (repo) return GIT_EEXISTS;
 	int ret = git_repository_init(&repo, path.c_str(), false);
-	if (ret == GIT_OK)
+	if (ret == GIT_OK) {
 		git_repository_index(&index, repo);
+		handle = new nvgt_git_repository_handle(repo, index);
+	} else repo = NULL;
 	return ret;
 }
 bool nvgt_git_repository::close() {
 	if (!index && !repo) return false;
-	if (index) git_index_free(index);
-	if (repo) git_repository_free(repo);
+	// The repository and its index are freed when the last commit, iterator or running add_all() made from them lets go (see
+	// nvgt_git_repository_handle).
 	index = NULL;
 	repo = NULL;
+	if (handle) handle->release();
+	handle = NULL;
 	return true;
+}
+// Refuses a change to the index while add_all(), update_all() or remove_all() runs a script callback over it, see below.
+static int refuse_busy() {
+	git_error_set_str(GIT_ERROR_INVALID, "the index can't be changed or committed from an add_all, update_all or remove_all callback");
+	return GIT_ELOCKED;
+}
+// add_all(), update_all() and remove_all() with a callback run script code in the middle of libgit2's walk over the index. A callback
+// that changed the same index (add(), remove(), another add_all()...) moved or freed the entry being walked (remove_all() reads it
+// again after the callback), and one that closed the repository or let go of the last reference to it freed the index under the walk.
+// While the callback can run, the methods that change the index refuse with GIT_ELOCKED, and the index, its repository and this
+// object are held until the walk ends.
+nvgt_git_repository_handle* nvgt_git_repository::begin_callback_operation(asIScriptFunction* callback, const std::string& payload) {
+	add_ref();
+	handle->add_ref();
+	busy = true;
+	match_callback = callback;
+	match_callback_payload = payload;
+	return handle;
+}
+void nvgt_git_repository::end_callback_operation(nvgt_git_repository_handle* h) {
+	match_callback = NULL;
+	busy = false;
+	h->release();
+	release(); // can let go of this object: nothing may use it after this call
+}
+// The paths arrays are declared string[]@, a handle whose reference the function is given to let go of: they were kept, so every call
+// leaked its array. So is the callback's, which was let go of whether or not there was one (a null callback crashed).
+static int release_args(int ret, CScriptArray* paths, asIScriptFunction* callback = NULL) {
+	if (paths) paths->Release();
+	if (callback) callback->Release();
+	return ret;
 }
 int nvgt_git_repository::add(const std::string& path) {
 	if (!index) return GIT_ERROR;
+	if (busy) return refuse_busy();
 	return git_index_add_bypath(index, path.c_str());
 }
 int nvgt_git_repository::add_all(CScriptArray* paths, int flags) {
-	if (!index || !paths) return GIT_ERROR;
+	if (!index || !paths) return release_args(GIT_ERROR, paths);
+	if (busy) return release_args(refuse_busy(), paths);
 	git_strarray paths_list = as_strarray2git_strarray(paths);
 	int ret = git_index_add_all(index, &paths_list, flags, nvgt_git_changed_match_callback, repo);
 	free(paths_list.strings);
-	return ret;
+	return release_args(ret, paths);
 }
 int nvgt_git_repository::add_all_cb(CScriptArray* paths, int flags, asIScriptFunction* match_callback, const std::string& match_callback_payload) {
-	if (!index || !paths) return GIT_ERROR;
+	if (!index || !paths) return release_args(GIT_ERROR, paths, match_callback);
+	if (busy) return release_args(refuse_busy(), paths, match_callback);
 	git_strarray paths_list = as_strarray2git_strarray(paths);
-	this->match_callback = match_callback;
-	this->match_callback_payload = match_callback_payload;
-	int ret = git_index_add_all(index, &paths_list, flags, this->match_callback ? nvgt_git_default_match_callback : NULL, this);
-	match_callback->Release();
-	this->match_callback = NULL;
+	nvgt_git_repository_handle* h = begin_callback_operation(match_callback, match_callback_payload);
+	int ret = git_index_add_all(h->index, &paths_list, flags, match_callback ? nvgt_git_default_match_callback : NULL, this);
+	end_callback_operation(h);
 	free(paths_list.strings);
-	return ret;
+	return release_args(ret, paths, match_callback);
 }
 int nvgt_git_repository::remove(const std::string& path) {
 	if (!index) return GIT_ERROR;
+	if (busy) return refuse_busy();
 	return git_index_remove_bypath(index, path.c_str());
 }
 int nvgt_git_repository::remove_all(CScriptArray* paths) {
-	if (!index || !paths) return GIT_ERROR;
+	if (!index || !paths) return release_args(GIT_ERROR, paths);
+	if (busy) return release_args(refuse_busy(), paths);
 	git_strarray paths_list = as_strarray2git_strarray(paths);
 	int ret = git_index_remove_all(index, &paths_list, nvgt_git_changed_match_callback, repo);
 	free(paths_list.strings);
-	return ret;
+	return release_args(ret, paths);
 }
 int nvgt_git_repository::remove_all_cb(CScriptArray* paths, asIScriptFunction* match_callback, const std::string& match_callback_payload) {
-	if (!index || !paths) return GIT_ERROR;
+	if (!index || !paths) return release_args(GIT_ERROR, paths, match_callback);
+	if (busy) return release_args(refuse_busy(), paths, match_callback);
 	git_strarray paths_list = as_strarray2git_strarray(paths);
-	this->match_callback = match_callback;
-	this->match_callback_payload = match_callback_payload;
-	int ret = git_index_remove_all(index, &paths_list, this->match_callback ? nvgt_git_default_match_callback : NULL, this);
-	match_callback->Release();
-	this->match_callback = NULL;
+	nvgt_git_repository_handle* h = begin_callback_operation(match_callback, match_callback_payload);
+	int ret = git_index_remove_all(h->index, &paths_list, match_callback ? nvgt_git_default_match_callback : NULL, this);
+	end_callback_operation(h);
 	free(paths_list.strings);
-	return ret;
+	return release_args(ret, paths, match_callback);
 }
 int nvgt_git_repository::update_all(CScriptArray* paths) {
-	if (!index || !paths) return GIT_ERROR;
+	if (!index || !paths) return release_args(GIT_ERROR, paths);
+	if (busy) return release_args(refuse_busy(), paths);
 	git_strarray paths_list = as_strarray2git_strarray(paths);
 	int ret = git_index_update_all(index, &paths_list, nvgt_git_changed_match_callback, repo);
 	free(paths_list.strings);
-	return ret;
+	return release_args(ret, paths);
 }
 int nvgt_git_repository::update_all_cb(CScriptArray* paths, asIScriptFunction* match_callback, const std::string& match_callback_payload) {
-	if (!index || !paths) return GIT_ERROR;
+	if (!index || !paths) return release_args(GIT_ERROR, paths, match_callback);
+	if (busy) return release_args(refuse_busy(), paths, match_callback);
 	git_strarray paths_list = as_strarray2git_strarray(paths);
-	this->match_callback = match_callback;
-	this->match_callback_payload = match_callback_payload;
-	int ret = git_index_update_all(index, &paths_list, this->match_callback ? nvgt_git_default_match_callback : NULL, this);
-	match_callback->Release();
-	this->match_callback = NULL;
+	nvgt_git_repository_handle* h = begin_callback_operation(match_callback, match_callback_payload);
+	int ret = git_index_update_all(h->index, &paths_list, match_callback ? nvgt_git_default_match_callback : NULL, this);
+	end_callback_operation(h);
 	free(paths_list.strings);
-	return ret;
+	return release_args(ret, paths, match_callback);
 }
 nvgt_git_repository_commit* nvgt_git_repository::commit(const std::string& author, const std::string& author_email, const std::string& committer, const std::string& committer_email, const std::string& message, const std::string& commit_ref) {
 	git_oid commit_oid, tree_oid;
@@ -162,6 +209,11 @@ nvgt_git_repository_commit* nvgt_git_repository::commit(const std::string& autho
 	git_reference* ref = NULL;
 	git_signature* signature_author;
 	git_signature* signature_committer;
+	if (!repo || !index) return NULL; // closed: the commit made below took the repository's handle, which closing let go of
+	if (busy) { // writing the tree from an add_all(), update_all() or remove_all() callback can reorder the index under the walk
+		refuse_busy();
+		return NULL;
+	}
 	int r = git_revparse_ext(&parent, &ref, repo, commit_ref.c_str());
 	if (r != GIT_OK && r != GIT_ENOTFOUND) return NULL;
 	if (git_index_write_tree(&tree_oid, index)) {
@@ -197,7 +249,7 @@ nvgt_git_repository_commit* nvgt_git_repository::commit(const std::string& autho
 	r = git_commit_create_v(&commit_oid, repo, commit_ref.c_str(), signature_author, signature_committer, NULL, clean_message.ptr ? clean_message.ptr : message.c_str(), tree, parent ? 1 : 0, parent);
 	git_commit* commit;
 	nvgt_git_repository_commit* ret = NULL;
-	if (!r && !git_commit_lookup(&commit, repo, &commit_oid)) ret = new nvgt_git_repository_commit(commit);
+	if (!r && !git_commit_lookup(&commit, repo, &commit_oid)) ret = new nvgt_git_repository_commit(commit, handle);
 	git_signature_free(signature_committer);
 	git_signature_free(signature_author);
 	git_tree_free(tree);
@@ -207,14 +259,14 @@ nvgt_git_repository_commit* nvgt_git_repository::commit(const std::string& autho
 	return ret;
 }
 std::string nvgt_git_repository::commit_diff(nvgt_git_repository_commit* commit1, nvgt_git_repository_commit* commit2, unsigned int context_lines, unsigned int interhunk_lines, unsigned int flags, unsigned int format, CScriptArray* pathspec, const std::string& old_prefix, const std::string& new_prefix) {
-	if (!commit1 || !commit2) return "";
+	if (!commit1 || !commit2 || !repo) return "";
 	git_tree* tree1 = NULL, * tree2 = NULL;
-	if (commit1 && git_commit_tree(&tree1, commit1->commit)) {
-		if (pathspec) pathspec->Release();
+	// pathspec is declared string[]@+, whose reference AngelScript keeps and lets go of: it was let go of here a second time when a
+	// commit's tree couldn't be read (the array freed under the script).
+	if (git_commit_tree(&tree1, commit1->commit))
 		return "";
-	}
-	if (commit2 && git_commit_tree(&tree2, commit2->commit)) {
-		if (pathspec) pathspec->Release();
+	if (git_commit_tree(&tree2, commit2->commit)) {
+		git_tree_free(tree1);
 		return "";
 	}
 	git_diff* diff = NULL;
@@ -237,6 +289,7 @@ std::string nvgt_git_repository::commit_diff(nvgt_git_repository_commit* commit1
 	if (!git_diff_to_buf(&output, diff, (git_diff_format_t)format))
 		ret = std::string(output.ptr, output.size);
 	git_buf_dispose(&output);
+	git_diff_free(diff); // it was never freed
 	if (tree1) git_tree_free(tree1);
 	git_tree_free(tree2);
 	if (opts.pathspec.strings) free(opts.pathspec.strings);
@@ -244,16 +297,23 @@ std::string nvgt_git_repository::commit_diff(nvgt_git_repository_commit* commit1
 }
 nvgt_git_repository_commit* nvgt_git_repository::commit_lookup(const std::string& id) {
 	git_oid oid;
-	if (git_oid_fromstr(&oid, id.c_str())) return NULL;
+	if (!repo || git_oid_fromstr(&oid, id.c_str())) return NULL;
 	git_commit* c;
 	if (git_commit_lookup(&c, repo, &oid)) return NULL;
-	return new nvgt_git_repository_commit(c);
+	return new nvgt_git_repository_commit(c, handle);
 }
 nvgt_git_repository_commit_iterator* nvgt_git_repository::commit_iterate(CScriptArray* path_filter, const std::string& author_filter, const std::string& message_filter, git_time_t min_time_filter, git_time_t max_time_filter, unsigned int start, unsigned int count) {
 	git_revwalk* w = NULL;
-	if (git_revwalk_new(&w, repo)) return NULL;
+	if (!repo || git_revwalk_new(&w, repo)) {
+		if (path_filter) path_filter->Release();
+		return NULL;
+	}
 	git_revwalk_push_head(w);
-	return new nvgt_git_repository_commit_iterator(w, path_filter, author_filter, message_filter, min_time_filter, max_time_filter, start, count);
+	// The iterator copies the paths, and the array, given as string[]@ for this function to let go of, is let go of here: it was kept
+	// for good, and the iterator pointed into its strings (which the script could still change or free).
+	nvgt_git_repository_commit_iterator* it = new nvgt_git_repository_commit_iterator(w, handle, path_filter, author_filter, message_filter, min_time_filter, max_time_filter, start, count);
+	if (path_filter) path_filter->Release();
+	return it;
 }
 nvgt_git_repository_entry* nvgt_git_repository::get_entry(unsigned int n) {
 	if (!index) return NULL;
@@ -283,7 +343,7 @@ const std::string nvgt_git_repository::get_path() {
 const std::string nvgt_git_repository::get_workdir() {
 	if (!repo) return "";
 	const char* p = git_repository_workdir(repo);
-	return std::string(p, strlen(p));
+	return p ? std::string(p) : ""; // null for a bare repository, which strlen() was given
 }
 nvgt_git_repository* new_git_repository() {
 	return new nvgt_git_repository();
@@ -305,13 +365,17 @@ void nvgt_git_repository_commit::get_signatures() {
 nvgt_git_repository_commit* nvgt_git_repository_commit::get_parent(int idx) {
 	git_commit* c = NULL;
 	if (git_commit_parent(&c, commit, idx) != GIT_OK) return NULL;
-	return new nvgt_git_repository_commit(c);
+	return new nvgt_git_repository_commit(c, handle);
 }
 bool nvgt_git_repository_commit_iterator::next() {
 	git_oid c_oid;
 	git_commit* c = NULL;
 	bool found_commit = false;
 	while (git_revwalk_next(&c_oid, walker) == GIT_OK) {
+		// A commit the filters skipped was never freed, nor were the parents and trees of a commit whose diff couldn't be made.
+		if (c) git_commit_free(c);
+		c = NULL;
+		if (count > 0 && inserted_entries >= count) return false; // it walked the rest of the history, diffing each commit, to find none
 		if (git_commit_lookup(&c, git_revwalk_repository(walker), &c_oid) != GIT_OK) return false;
 		if (dopts.pathspec.count) {
 			int parents = git_commit_parentcount(c);
@@ -328,9 +392,9 @@ bool nvgt_git_repository_commit_iterator::next() {
 					git_commit* parent;
 					if (git_commit_parent(&parent, c, i)) continue;
 					git_diff* diff;
-					if (git_commit_tree(&tree1, parent)) continue;
-					if (git_commit_tree(&tree2, c)) continue;
-					if (git_diff_tree_to_tree(&diff, git_commit_owner(c), tree1, tree2, &dopts)) continue;
+					if (git_commit_tree(&tree1, parent)) { git_commit_free(parent); continue; }
+					if (git_commit_tree(&tree2, c)) { git_tree_free(tree1); git_commit_free(parent); continue; }
+					if (git_diff_tree_to_tree(&diff, git_commit_owner(c), tree1, tree2, &dopts)) { git_tree_free(tree1); git_tree_free(tree2); git_commit_free(parent); continue; }
 					int deltas = git_diff_num_deltas(diff);
 					git_diff_free(diff);
 					git_tree_free(tree1);
@@ -352,14 +416,16 @@ bool nvgt_git_repository_commit_iterator::next() {
 		if (message_filter != "" && strstr(git_commit_message(c), message_filter.c_str()) == NULL) continue;
 		current_entry++;
 		if (current_entry < start) continue;
-		if (count > 0 && inserted_entries + 1 > count) continue;
 		inserted_entries++;
 		found_commit = true;
 		break;
 	}
-	if (!found_commit) return false;
+	if (!found_commit) {
+		if (c) git_commit_free(c);
+		return false;
+	}
 	if (commit) commit->release();
-	commit = new nvgt_git_repository_commit(c);
+	commit = new nvgt_git_repository_commit(c, handle);
 	return true;
 }
 
@@ -443,7 +509,10 @@ void RegisterGit(asIScriptEngine* engine) {
 }
 
 plugin_main(nvgt_plugin_shared* shared) {
-	prepare_plugin(shared);
+	if (!prepare_plugin(shared)) return false; // built for another plugin API version: the AngelScript functions weren't set
+	// The array add-on compiled into this plugin had null memory functions (see ASAddon/src/scriptarray.cpp): letting go of the last
+	// reference to an array, as add_all() does with a temporary one, crashed. The engine's are used, as unicode.cpp does.
+	CScriptArray::SetMemoryFunctions(asAllocMem, asFreeMem);
 	g_ScriptEngine = shared->script_engine;
 	RegisterGit(shared->script_engine);
 	nvgt_bundle_shared_library("git2");
