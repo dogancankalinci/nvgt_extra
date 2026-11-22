@@ -47,13 +47,6 @@ int nvgt_git_default_match_callback(const char* path, const char* matched, void*
 	}
 	return ret;
 }
-int nvgt_git_changed_match_callback(const char* path, const char* matched, void* payload) {
-	git_repository* repo = (git_repository*)payload;
-	unsigned int status;
-	if (git_status_file(&status, repo, path) < 0) return -1;
-	if ((status & GIT_STATUS_WT_MODIFIED) || (status & GIT_STATUS_WT_NEW)) return 0;
-	return 1;
-}
 inline git_strarray as_strarray2git_strarray(CScriptArray* as_array) {
 	git_strarray strarray;
 	strarray.count = as_array->GetSize();
@@ -147,7 +140,9 @@ int nvgt_git_repository::add_all(CScriptArray* paths, int flags) {
 	if (!index || !paths) return release_args(GIT_ERROR, paths);
 	if (busy) return release_args(refuse_busy(), paths);
 	git_strarray paths_list = as_strarray2git_strarray(paths);
-	int ret = git_index_add_all(index, &paths_list, flags, nvgt_git_changed_match_callback, repo);
+	// libgit2 visits the files that differ from the index, as git add -A does. A filter that let only changed and new ones through kept
+	// deleted files in the index, and ignored files out of it with GIT_INDEX_ADD_FORCE too.
+	int ret = git_index_add_all(index, &paths_list, flags, NULL, NULL);
 	free(paths_list.strings);
 	return release_args(ret, paths);
 }
