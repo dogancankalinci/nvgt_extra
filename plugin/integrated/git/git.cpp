@@ -407,7 +407,7 @@ bool nvgt_git_repository_commit_iterator::next() {
 		const git_signature* sig = git_commit_author(c);
 		bool author_match = true;
 		if ((min_time_filter > 0 || max_time_filter > 0 || author_filter != "") && !sig) continue;
-		if (min_time_filter > 0 && sig->when.time < min_time_filter || max_time_filter > 0 && max_time_filter > min_time_filter && sig->when.time > max_time_filter) continue;
+		if (min_time_filter > 0 && sig->when.time < min_time_filter || max_time_filter > 0 && max_time_filter >= min_time_filter && sig->when.time > max_time_filter) continue;
 		if (author_filter != "" && strstr(sig->name, author_filter.c_str()) == NULL && strstr(sig->email, author_filter.c_str()) == NULL) author_match = false;
 		sig = git_commit_committer(c);
 		if (!sig && author_filter != "") continue;
@@ -466,7 +466,7 @@ void RegisterGit(asIScriptEngine* engine) {
 	engine->RegisterObjectMethod("git_repository", "git_repository_commit@ commit(const string&in author, const string&in author_email, const string&in committer, const string&in committer_email, const string&in message, const string&in ref=\"HEAD\")", asMETHOD(nvgt_git_repository, commit), asCALL_THISCALL);
 	engine->RegisterObjectMethod("git_repository", "string commit_diff(git_repository_commit@+ commit1, git_repository_commit@+ commit2, uint context_lines=3, uint interhunk_lines=0, uint flags=0, uint format=1, string[]@+ pathspec={}, const string&in old_prefix=\"a\", const string&in new_prefix=\"b\")", asMETHOD(nvgt_git_repository, commit_diff), asCALL_THISCALL);
 	engine->RegisterObjectMethod("git_repository", "git_repository_commit@ commit_lookup(const string&in oid)", asMETHOD(nvgt_git_repository, commit_lookup), asCALL_THISCALL);
-	engine->RegisterObjectMethod("git_repository", "git_repository_commit_iterator@ commit_iterate(string[]@ path_filter={}, const string&in author_filter='', const string&in message_filter='', uint64 min_time_filter=0, uint64 max_time_filter=0, uint start=0, uint count=0)", asMETHOD(nvgt_git_repository, commit_iterate), asCALL_THISCALL);
+	engine->RegisterObjectMethod("git_repository", "git_repository_commit_iterator@ commit_iterate(string[]@ path_filter={}, const string&in author_filter='', const string&in message_filter='', int64 min_time_filter=0, int64 max_time_filter=0, uint start=0, uint count=0)", asMETHOD(nvgt_git_repository, commit_iterate), asCALL_THISCALL);
 	engine->RegisterObjectMethod("git_repository", "git_repository_entry@ get_entry(uint index)", asMETHOD(nvgt_git_repository, get_entry), asCALL_THISCALL);
 	engine->RegisterObjectMethod("git_repository", "int get_entry_count() property", asMETHOD(nvgt_git_repository, get_entry_count), asCALL_THISCALL);
 	engine->RegisterObjectMethod("git_repository", "int get_is_empty() property", asMETHOD(nvgt_git_repository, get_is_empty), asCALL_THISCALL);
@@ -484,7 +484,7 @@ void RegisterGit(asIScriptEngine* engine) {
 
 	engine->RegisterObjectBehaviour("git_repository_commit", asBEHAVE_ADDREF, "void f()", asMETHOD(nvgt_git_repository_commit, add_ref), asCALL_THISCALL);
 	engine->RegisterObjectBehaviour("git_repository_commit", asBEHAVE_RELEASE, "void f()", asMETHOD(nvgt_git_repository_commit, release), asCALL_THISCALL);
-	engine->RegisterObjectMethod("git_repository_commit", "uint get_time() property", asMETHOD(nvgt_git_repository_commit, get_time), asCALL_THISCALL);
+	engine->RegisterObjectMethod("git_repository_commit", "int64 get_time() property", asMETHOD(nvgt_git_repository_commit, get_time), asCALL_THISCALL);
 	engine->RegisterObjectMethod("git_repository_commit", "int get_parent_count() property", asMETHOD(nvgt_git_repository_commit, get_parent_count), asCALL_THISCALL);
 	engine->RegisterObjectMethod("git_repository_commit", "git_repository_commit@ get_parent(uint)", asMETHOD(nvgt_git_repository_commit, get_parent), asCALL_THISCALL);
 	engine->RegisterObjectMethod("git_repository_commit", "const string get_id() property", asMETHOD(nvgt_git_repository_commit, get_id), asCALL_THISCALL);

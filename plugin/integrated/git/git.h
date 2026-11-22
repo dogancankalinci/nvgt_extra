@@ -90,7 +90,7 @@ public:
 	nvgt_git_repository_commit(git_commit* c, nvgt_git_repository_handle* h) : ref_count(1), commit(c), handle(h) { handle->add_ref(); }
 	void add_ref() { asAtomicInc(ref_count); }
 	void release() { if (asAtomicDec(ref_count) < 1) { git_commit_free(commit); handle->release(); delete this; } }
-	unsigned int get_time() { return git_commit_time(commit); }
+	git_time_t get_time() { return git_commit_time(commit); } // 64 bits, signed: cut to a uint, a commit made before 1970 or after 2106 got another date
 	int get_parent_count() { return git_commit_parentcount(commit); }
 	nvgt_git_repository_commit* get_parent(int idx);
 	const std::string get_id() { const char* o = git_oid_tostr_s(git_commit_id(commit)); return std::string(o, strlen(o)); }
