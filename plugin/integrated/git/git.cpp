@@ -170,7 +170,9 @@ int nvgt_git_repository::remove_all(CScriptArray* paths) {
 	if (!index || !paths) return release_args(GIT_ERROR, paths);
 	if (busy) return release_args(refuse_busy(), paths);
 	git_strarray paths_list = as_strarray2git_strarray(paths);
-	int ret = git_index_remove_all(index, &paths_list, nvgt_git_changed_match_callback, repo);
+	// Every entry that matches is removed, whatever the state of its file, as git rm --cached does. Only the entries of files changed in
+	// the working directory were, so a clean or deleted file's never left the index.
+	int ret = git_index_remove_all(index, &paths_list, NULL, NULL);
 	free(paths_list.strings);
 	return release_args(ret, paths);
 }
@@ -188,7 +190,9 @@ int nvgt_git_repository::update_all(CScriptArray* paths) {
 	if (!index || !paths) return release_args(GIT_ERROR, paths);
 	if (busy) return release_args(refuse_busy(), paths);
 	git_strarray paths_list = as_strarray2git_strarray(paths);
-	int ret = git_index_update_all(index, &paths_list, nvgt_git_changed_match_callback, repo);
+	// libgit2 visits the tracked files that differ from the index: changed ones are updated and deleted ones removed, as git add -u does.
+	// A filter that let only files changed in the working directory through kept deleted files in the index.
+	int ret = git_index_update_all(index, &paths_list, NULL, NULL);
 	free(paths_list.strings);
 	return release_args(ret, paths);
 }
