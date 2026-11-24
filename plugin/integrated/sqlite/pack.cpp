@@ -447,7 +447,6 @@ void pack::clear() {
 CScriptArray* pack::find(const string& what, const FindMode mode) {
 	asIScriptContext* ctx = asGetActiveContext();
 	asIScriptEngine* engine = ctx->GetEngine();
-	CScriptArray* array = CScriptArray::Create(engine->GetTypeInfoByDecl("array<string>"));
 	static const char* queries[] = {
 		"select file_name from pack_files where file_name like ?",
 		"select file_name from pack_files where file_name glob ?",
@@ -455,12 +454,18 @@ CScriptArray* pack::find(const string& what, const FindMode mode) {
 	};
 	const int query = static_cast<int>(mode);
 	if (query < 0 || query > 2) throw invalid_argument("invalid find mode"); // A mode that isn't one of the three read past the queries.
-	auto stmt = prepare_stmt(db, queries[query]);
-	bind_text(db, stmt, 1, what);
-	query_rows(db, stmt, [&](sqlite3_stmt* s) {
-		string res = column_string(s, 0);
-		array->InsertLast(&res);
-	});
+	CScriptArray* array = CScriptArray::Create(engine->GetTypeInfoByDecl("array<string>"));
+	try { // The array is let go of when the query fails: every throw here kept it.
+		auto stmt = prepare_stmt(db, queries[query]);
+		bind_text(db, stmt, 1, what);
+		query_rows(db, stmt, [&](sqlite3_stmt* s) {
+			string res = column_string(s, 0);
+			array->InsertLast(&res);
+		});
+	} catch (...) {
+		array->Release();
+		throw;
+	}
 	return array;
 }
 
@@ -485,6 +490,7 @@ CScriptArray* pack::exec(const string& sql) {
 		d->Release();
 		return 0;
 	}, array, &errmsg); rc != SQLITE_OK) {
+		array->Release(); // As in find().
 		if (errmsg) {
 			string error(errmsg);
 			sqlite3_free(errmsg);
