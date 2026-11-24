@@ -347,6 +347,7 @@ CScriptArray* pack::list_files() {
 	asIScriptContext* ctx = asGetActiveContext();
 	asIScriptEngine* engine = ctx->GetEngine();
 	CScriptArray* array = CScriptArray::Create(engine->GetTypeInfoByDecl("array<string>"));
+	if (!array) return nullptr;
 	array->Reserve(static_cast<asUINT>(entry_cache.size()));
 	for (const auto& [name, entry] : entry_cache) {
 		string n = name;
@@ -455,6 +456,7 @@ CScriptArray* pack::find(const string& what, const FindMode mode) {
 	const int query = static_cast<int>(mode);
 	if (query < 0 || query > 2) throw invalid_argument("invalid find mode"); // A mode that isn't one of the three read past the queries.
 	CScriptArray* array = CScriptArray::Create(engine->GetTypeInfoByDecl("array<string>"));
+	if (!array) return nullptr;
 	try { // The array is let go of when the query fails: every throw here kept it.
 		auto stmt = prepare_stmt(db, queries[query]);
 		bind_text(db, stmt, 1, what);
@@ -473,6 +475,7 @@ CScriptArray* pack::exec(const string& sql) {
 	asIScriptContext* ctx = asGetActiveContext();
 	asIScriptEngine* engine = ctx->GetEngine();
 	CScriptArray* array = CScriptArray::Create(engine->GetTypeInfoByDecl("array<dictionary@>"));
+	if (!array) return nullptr;
 	char* errmsg;
 	if (const auto rc = sqlite3_exec(db, sql.data(), [](void* arr, int column_count, char** column_data, char** columns) -> int {
 		CScriptArray* array = (CScriptArray*)arr;

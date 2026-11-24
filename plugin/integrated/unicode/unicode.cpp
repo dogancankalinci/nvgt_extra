@@ -61,6 +61,7 @@ res = una::caseless::find_utf8(string1, string2);
 asQWORD start = res ? asQWORD(res.pos()) : ~asQWORD(0);
 asQWORD end = res ? asQWORD(res.end_pos()) : ~asQWORD(0);
 auto array = CScriptArray::Create(asGetActiveContext()->GetEngine()->GetTypeInfoByDecl("array<uint64>"));
+if (!array) return nullptr;
 array->InsertLast(&start);
 array->InsertLast(&end);
 return array;
