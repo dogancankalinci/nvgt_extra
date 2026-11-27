@@ -47,13 +47,18 @@ int nvgt_git_default_match_callback(const char* path, const char* matched, void*
 	}
 	return ret;
 }
-inline git_strarray as_strarray2git_strarray(CScriptArray* as_array) {
-	git_strarray strarray;
+// False with no memory for the list of pointers, which was filled in through the null pointer malloc() gave (a crash). The callers then fail
+// with GIT_ERROR: an empty list would match every path.
+inline bool as_strarray2git_strarray(CScriptArray* as_array, git_strarray& strarray) {
 	strarray.count = as_array->GetSize();
 	strarray.strings = (char**)malloc(strarray.count * sizeof(char*));
+	if (!strarray.strings && strarray.count > 0) {
+		strarray.count = 0;
+		return false;
+	}
 	for (int i = 0; i < strarray.count; i++)
 		strarray.strings[i] = (char*)(*(std::string*)as_array->At(i)).c_str();
-	return strarray;
+	return true;
 }
 
 
@@ -139,7 +144,8 @@ int nvgt_git_repository::add(const std::string& path) {
 int nvgt_git_repository::add_all(CScriptArray* paths, int flags) {
 	if (!index || !paths) return release_args(GIT_ERROR, paths);
 	if (busy) return release_args(refuse_busy(), paths);
-	git_strarray paths_list = as_strarray2git_strarray(paths);
+	git_strarray paths_list;
+	if (!as_strarray2git_strarray(paths, paths_list)) return release_args(GIT_ERROR, paths);
 	// libgit2 visits the files that differ from the index, as git add -A does. A filter that let only changed and new ones through kept
 	// deleted files in the index, and ignored files out of it with GIT_INDEX_ADD_FORCE too.
 	int ret = git_index_add_all(index, &paths_list, flags, NULL, NULL);
@@ -149,7 +155,8 @@ int nvgt_git_repository::add_all(CScriptArray* paths, int flags) {
 int nvgt_git_repository::add_all_cb(CScriptArray* paths, int flags, asIScriptFunction* match_callback, const std::string& match_callback_payload) {
 	if (!index || !paths) return release_args(GIT_ERROR, paths, match_callback);
 	if (busy) return release_args(refuse_busy(), paths, match_callback);
-	git_strarray paths_list = as_strarray2git_strarray(paths);
+	git_strarray paths_list;
+	if (!as_strarray2git_strarray(paths, paths_list)) return release_args(GIT_ERROR, paths, match_callback);
 	nvgt_git_repository_handle* h = begin_callback_operation(match_callback, match_callback_payload);
 	int ret = git_index_add_all(h->index, &paths_list, flags, match_callback ? nvgt_git_default_match_callback : NULL, this);
 	end_callback_operation(h);
@@ -164,7 +171,8 @@ int nvgt_git_repository::remove(const std::string& path) {
 int nvgt_git_repository::remove_all(CScriptArray* paths) {
 	if (!index || !paths) return release_args(GIT_ERROR, paths);
 	if (busy) return release_args(refuse_busy(), paths);
-	git_strarray paths_list = as_strarray2git_strarray(paths);
+	git_strarray paths_list;
+	if (!as_strarray2git_strarray(paths, paths_list)) return release_args(GIT_ERROR, paths);
 	// Every entry that matches is removed, whatever the state of its file, as git rm --cached does. Only the entries of files changed in
 	// the working directory were, so a clean or deleted file's never left the index.
 	int ret = git_index_remove_all(index, &paths_list, NULL, NULL);
@@ -174,7 +182,8 @@ int nvgt_git_repository::remove_all(CScriptArray* paths) {
 int nvgt_git_repository::remove_all_cb(CScriptArray* paths, asIScriptFunction* match_callback, const std::string& match_callback_payload) {
 	if (!index || !paths) return release_args(GIT_ERROR, paths, match_callback);
 	if (busy) return release_args(refuse_busy(), paths, match_callback);
-	git_strarray paths_list = as_strarray2git_strarray(paths);
+	git_strarray paths_list;
+	if (!as_strarray2git_strarray(paths, paths_list)) return release_args(GIT_ERROR, paths, match_callback);
 	nvgt_git_repository_handle* h = begin_callback_operation(match_callback, match_callback_payload);
 	int ret = git_index_remove_all(h->index, &paths_list, match_callback ? nvgt_git_default_match_callback : NULL, this);
 	end_callback_operation(h);
@@ -184,7 +193,8 @@ int nvgt_git_repository::remove_all_cb(CScriptArray* paths, asIScriptFunction* m
 int nvgt_git_repository::update_all(CScriptArray* paths) {
 	if (!index || !paths) return release_args(GIT_ERROR, paths);
 	if (busy) return release_args(refuse_busy(), paths);
-	git_strarray paths_list = as_strarray2git_strarray(paths);
+	git_strarray paths_list;
+	if (!as_strarray2git_strarray(paths, paths_list)) return release_args(GIT_ERROR, paths);
 	// libgit2 visits the tracked files that differ from the index: changed ones are updated and deleted ones removed, as git add -u does.
 	// A filter that let only files changed in the working directory through kept deleted files in the index.
 	int ret = git_index_update_all(index, &paths_list, NULL, NULL);
@@ -194,7 +204,8 @@ int nvgt_git_repository::update_all(CScriptArray* paths) {
 int nvgt_git_repository::update_all_cb(CScriptArray* paths, asIScriptFunction* match_callback, const std::string& match_callback_payload) {
 	if (!index || !paths) return release_args(GIT_ERROR, paths, match_callback);
 	if (busy) return release_args(refuse_busy(), paths, match_callback);
-	git_strarray paths_list = as_strarray2git_strarray(paths);
+	git_strarray paths_list;
+	if (!as_strarray2git_strarray(paths, paths_list)) return release_args(GIT_ERROR, paths, match_callback);
 	nvgt_git_repository_handle* h = begin_callback_operation(match_callback, match_callback_payload);
 	int ret = git_index_update_all(h->index, &paths_list, match_callback ? nvgt_git_default_match_callback : NULL, this);
 	end_callback_operation(h);
@@ -270,8 +281,11 @@ std::string nvgt_git_repository::commit_diff(nvgt_git_repository_commit* commit1
 	}
 	git_diff* diff = NULL;
 	git_diff_options opts = GIT_DIFF_OPTIONS_INIT;
-	if (pathspec && pathspec->GetSize() > 0)
-		opts.pathspec = as_strarray2git_strarray(pathspec);
+	if (pathspec && pathspec->GetSize() > 0 && !as_strarray2git_strarray(pathspec, opts.pathspec)) {
+		git_tree_free(tree1);
+		git_tree_free(tree2);
+		return "";
+	}
 	opts.flags = flags;
 	opts.context_lines = context_lines;
 	opts.interhunk_lines = interhunk_lines;
